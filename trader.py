@@ -38,17 +38,17 @@ class PositionManager:
 class Trader:
     EMERALD_FAIR = 10_000
     EMERALD_DEFAULT_SPREAD = 2  # fallback half-spread when book is empty
-    TOMATO_FAST_PERIOD = 5
-    TOMATO_SLOW_PERIOD = 20
-    TOMATO_ORDER_SIZE = 5
+    TOMATO_WAP_PERIOD = 20
+    TOMATO_INV_MAX_SHIFT = 3   # max inventory skew in price ticks
+    TOMATO_OBI_THRESHOLD = 0.5  # OBI magnitude to trigger momentum shift
+    TOMATO_VOL_THRESHOLD = 10   # WAP range threshold for wide spread
+    TOMATO_SPREAD_TIGHT = 2
+    TOMATO_SPREAD_WIDE = 4
 
     def run(self, state: TradingState) -> tuple[dict[str, list[Order]], int, str]:
         # --- Deserialize persistent state ---
         data = json.loads(state.traderData) if state.traderData else {}
-        fast_ma = RollingAverage(self.TOMATO_FAST_PERIOD, data.get("tomato_fast", []))
-        slow_ma = RollingAverage(self.TOMATO_SLOW_PERIOD, data.get("tomato_slow", []))
-        prev_fast: float | None = data.get("prev_fast")
-        prev_slow: float | None = data.get("prev_slow")
+        tomato_wap = RollingAverage(self.TOMATO_WAP_PERIOD, data.get("tomato_window", []))
 
         orders: dict[str, list[Order]] = {}
 
@@ -56,24 +56,19 @@ class Trader:
         if "EMERALDS" in state.order_depths:
             orders["EMERALDS"] = self._market_make_emeralds(state)
 
-        # --- TOMATOES: MA Crossover ---
+        # --- TOMATOES: Mean-Reversion Market Making ---
         if "TOMATOES" in state.order_depths:
-            orders["TOMATOES"] = self._trade_tomatoes(
-                state, fast_ma, slow_ma, prev_fast, prev_slow
-            )
+            orders["TOMATOES"] = self._market_make_tomatoes(state, tomato_wap)
 
         # --- Serialize persistent state ---
         trader_data = json.dumps({
-            "tomato_fast": fast_ma.to_list(),
-            "tomato_slow": slow_ma.to_list(),
-            "prev_fast": fast_ma.average(),
-            "prev_slow": slow_ma.average(),
+            "tomato_window": tomato_wap.to_list(),
         })
 
         return orders, 0, trader_data
 
     # ------------------------------------------------------------------ #
-    #  EMERALDS — penny-the-spread market maker around fair value 10,000  #
+    #  EMERALDS — hybrid: sniper taker + passive maker at fair 10,000   #
     # ------------------------------------------------------------------ #
 
     def _market_make_emeralds(self, state: TradingState) -> list[Order]:
@@ -81,43 +76,47 @@ class Trader:
         position = state.position.get("EMERALDS", 0)
         result: list[Order] = []
 
-        # Best bid / ask from the book (may be empty)
-        best_bid = max(depth.buy_orders) if depth.buy_orders else None
-        best_ask = min(depth.sell_orders) if depth.sell_orders else None
+        # --- Sniper: buy underpriced sell orders (price < fair value) ---
+        for price in sorted(depth.sell_orders.keys()):
+            if price >= self.EMERALD_FAIR:
+                break
+            available = PositionManager.max_buy_quantity(position)
+            if available <= 0:
+                break
+            qty = min(available, abs(depth.sell_orders[price]))
+            result.append(Order("EMERALDS", price, qty))
+            position += qty
 
-        # --- Bid side ---
-        if best_bid is not None:
-            bid_price = min(best_bid + 1, self.EMERALD_FAIR - 1)  # penny but stay below fair
-        else:
-            bid_price = self.EMERALD_FAIR - self.EMERALD_DEFAULT_SPREAD
+        # --- Sniper: sell overpriced buy orders (price > fair value) ---
+        for price in sorted(depth.buy_orders.keys(), reverse=True):
+            if price <= self.EMERALD_FAIR:
+                break
+            available = PositionManager.max_sell_quantity(position)
+            if available <= 0:
+                break
+            qty = min(available, depth.buy_orders[price])
+            result.append(Order("EMERALDS", price, -qty))
+            position -= qty
 
+        # --- Maker: passive quotes for remaining capacity ---
         buy_qty = PositionManager.max_buy_quantity(position)
         if buy_qty > 0:
-            result.append(Order("EMERALDS", bid_price, buy_qty))
-
-        # --- Ask side ---
-        if best_ask is not None:
-            ask_price = max(best_ask - 1, self.EMERALD_FAIR + 1)  # penny but stay above fair
-        else:
-            ask_price = self.EMERALD_FAIR + self.EMERALD_DEFAULT_SPREAD
+            result.append(Order("EMERALDS", self.EMERALD_FAIR - self.EMERALD_DEFAULT_SPREAD, buy_qty))
 
         sell_qty = PositionManager.max_sell_quantity(position)
         if sell_qty > 0:
-            result.append(Order("EMERALDS", ask_price, -sell_qty))
+            result.append(Order("EMERALDS", self.EMERALD_FAIR + self.EMERALD_DEFAULT_SPREAD, -sell_qty))
 
         return result
 
     # ------------------------------------------------------------------ #
-    #  TOMATOES — dual MA crossover with incremental entry                #
+    #  TOMATOES — alpha equation: WAP + OBI momentum + inventory skew   #
     # ------------------------------------------------------------------ #
 
-    def _trade_tomatoes(
+    def _market_make_tomatoes(
         self,
         state: TradingState,
-        fast_ma: RollingAverage,
-        slow_ma: RollingAverage,
-        prev_fast: float | None,
-        prev_slow: float | None,
+        tomato_wap: RollingAverage,
     ) -> list[Order]:
         depth: OrderDepth = state.order_depths["TOMATOES"]
         position = state.position.get("TOMATOES", 0)
@@ -125,37 +124,50 @@ class Trader:
         best_bid = max(depth.buy_orders) if depth.buy_orders else None
         best_ask = min(depth.sell_orders) if depth.sell_orders else None
 
-        # Need both sides to compute mid-price
         if best_bid is None or best_ask is None:
             return []
 
-        mid = (best_bid + best_ask) / 2
-        fast_ma.update(mid)
-        slow_ma.update(mid)
+        best_bid_vol = depth.buy_orders[best_bid]
+        best_ask_vol = abs(depth.sell_orders[best_ask])
+        total_vol = best_bid_vol + best_ask_vol
 
-        fast_avg = fast_ma.average()
-        slow_avg = slow_ma.average()
+        # 1. WAP as base fair value
+        wap = (best_bid * best_ask_vol + best_ask * best_bid_vol) / total_vol
+        tomato_wap.update(wap)
 
-        # Not enough data yet for both MAs
-        if fast_avg is None or slow_avg is None:
-            return []
+        # 2. OBI momentum shift
+        obi = (best_bid_vol - best_ask_vol) / total_vol
+        if obi > self.TOMATO_OBI_THRESHOLD:
+            momentum_shift = 1
+        elif obi < -self.TOMATO_OBI_THRESHOLD:
+            momentum_shift = -1
+        else:
+            momentum_shift = 0
 
-        # Detect crossover relative to previous tick
-        if prev_fast is None or prev_slow is None:
-            return []
+        # 3. Inventory skew
+        inventory_shift = -(position / 20.0) * self.TOMATO_INV_MAX_SHIFT
+
+        # 4. Dynamic spread based on WAP volatility
+        wap_list = tomato_wap.to_list()
+        if len(wap_list) >= 2:
+            volatility = max(wap_list) - min(wap_list)
+            spread = self.TOMATO_SPREAD_WIDE if volatility > self.TOMATO_VOL_THRESHOLD else self.TOMATO_SPREAD_TIGHT
+        else:
+            spread = self.TOMATO_SPREAD_TIGHT
+
+        # 5. Final prices
+        target_price = wap + momentum_shift + inventory_shift
+        bid_price = int(round(target_price)) - spread
+        ask_price = int(round(target_price)) + spread
 
         result: list[Order] = []
 
-        # Bullish crossover: fast crosses above slow
-        if prev_fast <= prev_slow and fast_avg > slow_avg:
-            qty = min(self.TOMATO_ORDER_SIZE, PositionManager.max_buy_quantity(position))
-            if qty > 0:
-                result.append(Order("TOMATOES", best_ask, qty))
+        buy_qty = PositionManager.max_buy_quantity(position)
+        if buy_qty > 0:
+            result.append(Order("TOMATOES", bid_price, buy_qty))
 
-        # Bearish crossover: fast crosses below slow
-        elif prev_fast >= prev_slow and fast_avg < slow_avg:
-            qty = min(self.TOMATO_ORDER_SIZE, PositionManager.max_sell_quantity(position))
-            if qty > 0:
-                result.append(Order("TOMATOES", best_bid, -qty))
+        sell_qty = PositionManager.max_sell_quantity(position)
+        if sell_qty > 0:
+            result.append(Order("TOMATOES", ask_price, -sell_qty))
 
         return result
