@@ -39,11 +39,8 @@ class Trader:
     EMERALD_FAIR = 10_000
     EMERALD_DEFAULT_SPREAD = 2  # fallback half-spread when book is empty
     TOMATO_WAP_PERIOD = 20
-    TOMATO_INV_MAX_SHIFT = 3   # max inventory skew in price ticks
-    TOMATO_OBI_THRESHOLD = 0.5  # OBI magnitude to trigger momentum shift
-    TOMATO_VOL_THRESHOLD = 10   # WAP range threshold for wide spread
-    TOMATO_SPREAD_TIGHT = 2
-    TOMATO_SPREAD_WIDE = 4
+    TOMATO_INV_MAX_SHIFT = 3  # max inventory skew in price ticks
+    TOMATO_SPREAD = 3
 
     def run(self, state: TradingState) -> tuple[dict[str, list[Order]], int, str]:
         # --- Deserialize persistent state ---
@@ -98,14 +95,20 @@ class Trader:
             result.append(Order("EMERALDS", price, -qty))
             position -= qty
 
-        # --- Maker: passive quotes for remaining capacity ---
+        # --- Maker: dynamic penny quotes for remaining capacity ---
+        best_bid = max(depth.buy_orders) if depth.buy_orders else None
+        best_ask = min(depth.sell_orders) if depth.sell_orders else None
+
+        bid_price = min(best_bid + 1, self.EMERALD_FAIR - 1) if best_bid is not None else self.EMERALD_FAIR - self.EMERALD_DEFAULT_SPREAD
+        ask_price = max(best_ask - 1, self.EMERALD_FAIR + 1) if best_ask is not None else self.EMERALD_FAIR + self.EMERALD_DEFAULT_SPREAD
+
         buy_qty = PositionManager.max_buy_quantity(position)
         if buy_qty > 0:
-            result.append(Order("EMERALDS", self.EMERALD_FAIR - self.EMERALD_DEFAULT_SPREAD, buy_qty))
+            result.append(Order("EMERALDS", bid_price, buy_qty))
 
         sell_qty = PositionManager.max_sell_quantity(position)
         if sell_qty > 0:
-            result.append(Order("EMERALDS", self.EMERALD_FAIR + self.EMERALD_DEFAULT_SPREAD, -sell_qty))
+            result.append(Order("EMERALDS", ask_price, -sell_qty))
 
         return result
 
@@ -135,30 +138,13 @@ class Trader:
         wap = (best_bid * best_ask_vol + best_ask * best_bid_vol) / total_vol
         tomato_wap.update(wap)
 
-        # 2. OBI momentum shift
-        obi = (best_bid_vol - best_ask_vol) / total_vol
-        if obi > self.TOMATO_OBI_THRESHOLD:
-            momentum_shift = 1
-        elif obi < -self.TOMATO_OBI_THRESHOLD:
-            momentum_shift = -1
-        else:
-            momentum_shift = 0
-
-        # 3. Inventory skew
+        # 2. Inventory skew
         inventory_shift = -(position / 20.0) * self.TOMATO_INV_MAX_SHIFT
 
-        # 4. Dynamic spread based on WAP volatility
-        wap_list = tomato_wap.to_list()
-        if len(wap_list) >= 2:
-            volatility = max(wap_list) - min(wap_list)
-            spread = self.TOMATO_SPREAD_WIDE if volatility > self.TOMATO_VOL_THRESHOLD else self.TOMATO_SPREAD_TIGHT
-        else:
-            spread = self.TOMATO_SPREAD_TIGHT
-
-        # 5. Final prices
-        target_price = wap + momentum_shift + inventory_shift
-        bid_price = int(round(target_price)) - spread
-        ask_price = int(round(target_price)) + spread
+        # 3. Final prices
+        target_price = wap + inventory_shift
+        bid_price = int(round(target_price)) - self.TOMATO_SPREAD
+        ask_price = int(round(target_price)) + self.TOMATO_SPREAD
 
         result: list[Order] = []
 

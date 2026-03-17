@@ -34,7 +34,7 @@ State is persisted across ticks via the `traderData` JSON string — the only fo
 
 ## Strategies
 
-### EMERALDS — Hybrid Sniper + Passive Maker
+### EMERALDS — Hybrid Sniper + Dynamic Penny Maker
 
 **Fair value:** hardcoded at **10,000**.
 
@@ -43,23 +43,24 @@ State is persisted across ticks via the `traderData` JSON string — the only fo
 - Scans `buy_orders` sorted highest-first. Takes any bid **above** 10,000, up to remaining sell capacity.
 - Virtual position is updated after each fill so subsequent snipes and maker quotes never exceed the ±20 limit.
 
-**Phase 2 — Maker (Passive):**
-- After sniping, quotes the remaining capacity passively:
-  - Bid: `9998` (`EMERALD_FAIR - EMERALD_DEFAULT_SPREAD`)
-  - Ask: `10002` (`EMERALD_FAIR + EMERALD_DEFAULT_SPREAD`)
+**Phase 2 — Maker (Dynamic Pennying):**
+- After sniping, reads the remaining book and places dynamic penny quotes for leftover capacity:
+  - `bid_price = min(best_bid + 1, EMERALD_FAIR - 1)` — penny the best bid, clamped below fair value
+  - `ask_price = max(best_ask - 1, EMERALD_FAIR + 1)` — penny the best ask, clamped above fair value
+  - Fallback to `9998` / `10002` if the book is empty on either side
 
 **Tunable constants:**
 
 | Constant | Default | Description |
 |---|---|---|
 | `EMERALD_FAIR` | `10000` | Hard-coded fair value |
-| `EMERALD_DEFAULT_SPREAD` | `2` | Passive quote half-spread |
+| `EMERALD_DEFAULT_SPREAD` | `2` | Fallback half-spread when book is empty |
 
 ---
 
-### TOMATOES — Alpha Equation Market Maker
+### TOMATOES — WAP + Inventory Skew Market Maker
 
-A microstructure-aware passive market maker. Fair value and spread are dynamically computed each tick from five signal components.
+A microstructure-aware passive market maker using WAP as fair value with inventory skew.
 
 #### 1. Weighted Average Price (WAP)
 Base fair value using Level 1 order book volumes:
@@ -68,20 +69,7 @@ Base fair value using Level 1 order book volumes:
 wap = (best_bid × best_ask_vol + best_ask × best_bid_vol) / (best_bid_vol + best_ask_vol)
 ```
 
-The WAP is added to a 20-period rolling window for volatility calculation.
-
-#### 2. OBI Momentum Shift
-Order Book Imbalance detects short-term directional pressure:
-
-```
-obi = (best_bid_vol - best_ask_vol) / (best_bid_vol + best_ask_vol)
-
-momentum_shift = +1  if obi >  0.5   (buy pressure)
-momentum_shift = -1  if obi < -0.5   (sell pressure)
-momentum_shift =  0  otherwise
-```
-
-#### 3. Inventory Skew
+#### 2. Inventory Skew
 Shifts quotes to lean against the current position, reducing inventory risk:
 
 ```
@@ -91,22 +79,12 @@ inventory_shift = -(position / 20.0) × TOMATO_INV_MAX_SHIFT
 At max long (+20): quotes shift **−3** ticks (cheaper ask, unattractive bid).
 At max short (−20): quotes shift **+3** ticks (cheaper bid, unattractive ask).
 
-#### 4. Dynamic Spread (Volatility Filter)
-Spread widens automatically during high-volatility regimes:
+#### 3. Final Order Pricing
 
 ```
-volatility = max(wap_window) - min(wap_window)
-
-spread = TOMATO_SPREAD_WIDE (4)  if volatility > 10
-spread = TOMATO_SPREAD_TIGHT (2) otherwise
-```
-
-#### 5. Final Order Pricing
-
-```
-target_price = wap + momentum_shift + inventory_shift
-bid_price    = int(round(target_price)) - spread
-ask_price    = int(round(target_price)) + spread
+target_price = wap + inventory_shift
+bid_price    = int(round(target_price)) - TOMATO_SPREAD
+ask_price    = int(round(target_price)) + TOMATO_SPREAD
 ```
 
 Both sides are sized at maximum available quantity via `PositionManager`.
@@ -115,12 +93,9 @@ Both sides are sized at maximum available quantity via `PositionManager`.
 
 | Constant | Default | Description |
 |---|---|---|
-| `TOMATO_WAP_PERIOD` | `20` | Rolling window length for WAP / volatility |
+| `TOMATO_WAP_PERIOD` | `20` | Rolling WAP window length |
 | `TOMATO_INV_MAX_SHIFT` | `3` | Max inventory skew in ticks |
-| `TOMATO_OBI_THRESHOLD` | `0.5` | OBI level to trigger momentum shift |
-| `TOMATO_VOL_THRESHOLD` | `10` | WAP range to switch to wide spread |
-| `TOMATO_SPREAD_TIGHT` | `2` | Half-spread in normal conditions |
-| `TOMATO_SPREAD_WIDE` | `4` | Half-spread in high-volatility conditions |
+| `TOMATO_SPREAD` | `3` | Fixed half-spread around target price |
 
 ---
 
