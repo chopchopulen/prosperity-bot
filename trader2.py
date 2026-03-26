@@ -1,8 +1,7 @@
 """
-trader.py — IMC Prosperity 4 | V11 (Final)
-EMERALDS: V7 (flatten at 10000 + snipe + penny + 160k endgame) = 1050.
-TOMATOES: V6 (penny + WAP + threshold inv_shift + L1 skew) = 1383.
-Expected total: ~2433.
+trader.py — IMC Prosperity 4 | V6
+EMERALDS: snipe at 10000 when stuck + penny + end-game flattening.
+TOMATOES: penny + threshold inv_shift + L1 imbalance skew.
 """
 
 import json
@@ -27,20 +26,7 @@ class Trader:
         position = state.position.get("EMERALDS", 0)
         orders: list[Order] = []
 
-        # Phase 0: FLATTEN AT FAIR VALUE — take any 10000 event to move pos toward 0
-        if position > 0 and 10000 in depth.buy_orders:
-            vol = min(position, depth.buy_orders[10000])
-            if vol > 0:
-                orders.append(Order("EMERALDS", 10000, -vol))
-                position -= vol
-
-        if position < 0 and 10000 in depth.sell_orders:
-            vol = min(-position, abs(depth.sell_orders[10000]))
-            if vol > 0:
-                orders.append(Order("EMERALDS", 10000, vol))
-                position += vol
-
-        # Phase 1: SNIPE — when still stuck, sweep any remaining 10000+ events
+        # Phase 1: SNIPE — when stuck, take any 10000 event to free capacity
         if position >= 15:
             for bid_price in sorted(depth.buy_orders.keys(), reverse=True):
                 if bid_price >= 10000:
@@ -57,11 +43,11 @@ class Trader:
                         orders.append(Order("EMERALDS", ask_price, vol))
                         position += vol
 
-        # Phase 2: MAKE — penny with end-game flattening (160k)
+        # Phase 2: MAKE — penny with end-game flattening
         best_bid = max(depth.buy_orders) if depth.buy_orders else 9990
         best_ask = min(depth.sell_orders) if depth.sell_orders else 10010
 
-        if state.timestamp > 160000:
+        if state.timestamp > 170000:
             if position > 0:
                 bid_price = 9993
                 ask_price = 10001
@@ -98,6 +84,7 @@ class Trader:
         wap = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
         wap_int = int(round(wap))
 
+        # Threshold inventory shift: neutral below ±15, 1-tick shift above
         if position > 15:
             inv_shift = -1
         elif position < -15:
@@ -105,9 +92,11 @@ class Trader:
         else:
             inv_shift = 0
 
+        # Base penny quotes
         bid_price = best_bid + 1 + inv_shift
         ask_price = best_ask - 1 + inv_shift
 
+        # L1 imbalance skew: shift both quotes in predicted direction
         imbalance = bid_vol - ask_vol
         if imbalance >= 3:
             bid_price += 1
@@ -116,6 +105,7 @@ class Trader:
             bid_price -= 1
             ask_price -= 1
 
+        # Safety clamps
         bid_price = min(bid_price, wap_int - 1)
         ask_price = max(ask_price, wap_int + 1)
         if bid_price >= ask_price:

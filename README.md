@@ -1,155 +1,100 @@
 # IMC Prosperity 4 — Trading Bot
 
-Round 1 baseline ("Gold Standard") for the IMC Prosperity 4 competition.
-Trades two symbols — **EMERALDS** and **TOMATOES** — under strict constraints:
-pure Python, no external libraries, no persistent instance variables.
-
-**Round 0 result:** ~1,550 PnL
+Tutorial Round bot for IMC Prosperity 4.
+Trades **EMERALDS** and **TOMATOES** under strict constraints: pure Python, no external libraries, ±20 position limit per symbol.
 
 ---
 
-## Architecture
+## Version History
 
-### `RollingStats`
-Fixed-window rolling statistics backed by a plain list. Upgraded from the
-Tutorial Round `RollingAverage` — adds higher-order statistics for future
-Bollinger Band / Z-score strategies.
-
-| Method | Returns | Notes |
-|---|---|---|
-| `update(value)` | — | Appends value; evicts oldest when over `period` |
-| `average()` | `float \| None` | Population mean; `None` until window full |
-| `variance()` | `float \| None` | Σ(x−μ)²/N; `None` until window full |
-| `std_dev()` | `float \| None` | √variance; `None` until window full |
-| `z_score(value)` | `float \| None` | (value−μ)/σ; `None` if window not full or σ=0 |
-| `to_list()` | `list[float]` | Raw window for traderData serialisation |
-
-### `PositionManager`
-Static helpers enforcing the ±20 position hard limit on every order path.
-
-| Method | Returns |
-|---|---|
-| `max_buy_quantity(position, limit=20)` | `limit - position` |
-| `max_sell_quantity(position, limit=20)` | `position + limit` |
-
-### `Trader`
-Main class. The engine calls `run(state)` every tick.
-
-**Return signature:** `(orders: dict[str, list[Order]], conversions: int, traderData: str)`
-
-State is persisted across ticks via the `traderData` JSON string — the only
-form of memory available in this environment. The `run()` method acts as a
-**symbol router**, dispatching each asset to its dedicated strategy function.
+| Version | EMERALDS | TOMATOES | TOTAL | Key Change |
+|---------|----------|----------|-------|------------|
+| V5 | 959 | 1287 | 2246 | Penny maker + WAP fair value + gentle continuous inv_shift |
+| V6 | 959 | 1383 | 2342 | Threshold inv_shift (±1 at ±15) + L1 imbalance skew (±1 at ±3) |
+| V7 | **1050** | -890 | 160 | Emeralds: threshold-free 10000 flattening. Tomato compressed-spread taking = disaster |
+| V8 | 1050 | 1313 | 2363 | Reverted tomato to V6 base + mean reversion quote skew → adverse selection |
+| V9 | 1050 | 1158 | 2208 | Inventory ladder (asymmetric thresholds + one-sided quoting) → killed throughput |
+| V10 | 1050 | ~1440 | ~2490 | V7 emeralds + V6 tomatoes + tomato 180k endgame flattening |
+| **V11** | **1050** | **1383** | **~2433** | V7 emeralds + V6 tomatoes exactly (cleanest stable combo) |
 
 ---
 
-## Strategies
+## What We Learned (Failure Log)
 
-### EMERALDS — Hybrid Sniper + Dynamic Penny Maker
+These were tested and definitively ruled out:
 
-**Fair value:** hardcoded at **10,000**.
-
-**Phase 1 — Taker (Sniper):**
-- Scans `sell_orders` sorted lowest-first. Takes any ask **below** 10,000 up to remaining buy capacity.
-- Scans `buy_orders` sorted highest-first. Takes any bid **above** 10,000 up to remaining sell capacity.
-- Virtual position is updated after each fill so subsequent snipes and maker quotes never breach ±20.
-
-**Phase 2 — Maker (Dynamic Pennying):**
-After sniping, reads the remaining book and places penny quotes for leftover capacity:
-```
-bid_price = min(best_bid + 1, EMERALD_FAIR - 1)   # penny the bid, clamped below fair value
-ask_price = max(best_ask - 1, EMERALD_FAIR + 1)   # penny the ask, clamped above fair value
-```
-Falls back to `9998` / `10002` if either side of the book is empty.
-
-**Tunable constants:**
-
-| Constant | Default | Description |
-|---|---|---|
-| `EMERALD_FAIR` | `10000` | Hard-coded fair value |
-| `EMERALD_DEFAULT_SPREAD` | `2` | Fallback half-spread when book is empty |
+| Strategy | Result | Why |
+|----------|--------|-----|
+| Compressed spread taking (both sides) | -7216 on tomatoes | Taking bid AND ask simultaneously = guaranteed round-trip loss |
+| Mean reversion quote skew (shift both prices) | -70 vs V6 | Shifts both bid+ask → adverse selection: fills concentrate on wrong-prediction ticks |
+| L1 imbalance threshold at ±2 (down from ±3) | Worse | More false positives, adverse selection |
+| Combined signal boost (L1 + mean_rev agree) | No benefit | Fires too rarely; underlying skew mechanism is flawed |
+| Inventory ladder (asymmetric A/B/C) | -225 vs V6 | One-sided quoting at \|pos\|>8 too aggressive, collapses throughput |
+| MA crossover (5/20) | -4628 | Trend-following on mean-reverting asset |
+| Adaptive spread / spread=2 everywhere | Worse | Adverse selection eats the edge |
+| Multi-level emerald quotes | Worse | Splits fills, gives counterparty better prices |
+| Panic/urgency liquidation | Worse | Selling at 10001 = terrible prices |
+| OU/SDE/Feynman-Kac fair value | Negligible | Shifts price <1 point, pure overhead |
+| Aggressive SMA-based taking | Worse | SMA lags; "mispriced" orders aren't mispriced |
+| OBI (full book) prediction | 2.8% accuracy | Worse than random |
 
 ---
 
-### TOMATOES — Velocity-Based Regime Switch
+## Current Strategy (V11)
 
-A microstructure-aware strategy that detects trending vs. ranging conditions
-using a **5-tick WAP velocity** thermostat and switches execution logic accordingly.
+### EMERALDS — V7 Logic (1050, theoretical ceiling)
 
-#### 1. Weighted Average Price (WAP)
-Base fair value using Level 1 order book volumes:
-```
-wap = (best_bid × best_ask_vol + best_ask × best_bid_vol) / (best_bid_vol + best_ask_vol)
-```
+Fair value: **10,000** (hardcoded).
 
-#### 2. Velocity Thermostat
-```
-velocity = wap[now] − wap[5 ticks ago]
-```
-A 20-period `RollingStats` window tracks WAP history. The 5-tick lookback
-balances responsiveness against micro-noise.
+**Phase 0 — Flatten at fair value:**
+Every tick, if there's a resting order at exactly 10000 and we have a position, take it to move toward zero. This is zero-cost since 10000 = MtM price. Only flattens toward zero, never overshoots.
 
-#### 3. Regime Switch
+**Phase 1 — Snipe when stuck:**
+When position ≥ 15 (or ≤ -15), aggressively sweep any 10000+ bids (or 10000- asks) to free up capacity for penny fills.
 
-| Condition | Regime | Action |
-|---|---|---|
-| `velocity > 8` | **Bull breakout** | Aggressive bid at `round(wap) − 1`; no asks |
-| `velocity < −8` | **Bear breakout** | Aggressive ask at `round(wap) + 1`; no bids |
-| `−8 ≤ velocity ≤ 8` | **Ranging** | WAP + inventory-skew passive market maker |
-
-**Ranging market maker:**
-```
-inventory_shift = -(position / 20.0) × TOMATO_INV_MAX_SHIFT
-target_price    = wap + inventory_shift
-bid_price       = int(round(target_price)) - TOMATO_SPREAD
-ask_price       = int(round(target_price)) + TOMATO_SPREAD
-```
-
-At max long (+20): quotes shift −3 ticks (lowers ask, raises bid cost → discourages more buying).  
-At max short (−20): quotes shift +3 ticks (lowers bid cost, raises ask → discourages more selling).
-
-**Tunable constants:**
-
-| Constant | Default | Description |
-|---|---|---|
-| `TOMATO_WAP_PERIOD` | `20` | Rolling WAP window length |
-| `TOMATO_INV_MAX_SHIFT` | `3` | Max inventory skew in ticks |
-| `TOMATO_SPREAD` | `3` | Fixed half-spread in ranging regime |
-| `VELOCITY_THRESHOLD` | `8` | 5-tick WAP delta to trigger breakout regime |
+**Phase 2 — Penny maker with endgame:**
+Quote `best_bid + 1` / `best_ask - 1`, clamped to 9999 / 10001.
+After timestamp 160,000: switch to closing-biased quotes (9993/10001 when long, 9999/10007 when short) to flatten position before sim end.
 
 ---
 
-### PAIRS TRADING — Skeleton (Round 1)
+### TOMATOES — V6 Logic (1383, best proven)
 
-`_run_pairs_trading(state, asset_a, asset_b, spread_stats)` is wired into
-the router but commented out pending Round 1 asset confirmation.
+Fair value: **WAP** — `(best_bid × ask_vol + best_ask × bid_vol) / (bid_vol + ask_vol)`.
 
-**Planned logic:**
-- Compute mid-price spread: `current_spread = mid_a − mid_b`
-- Track spread in a 20-period `RollingStats` window
-- Execute on Z-score extremes:
-  - `spread_z > 2.0` → Short A, Buy B (spread reverts down)
-  - `spread_z < −2.0` → Buy A, Short B (spread reverts up)
+**Penny maker:**
+```
+bid_price = best_bid + 1 + inv_shift + l1_skew
+ask_price = best_ask - 1 + inv_shift + l1_skew
+```
+
+**Inventory shift:** `±1 tick` when `|position| > 15`. Neutral otherwise. Applied to both quotes.
+
+**L1 imbalance skew:** When `bid_vol - ask_vol ≥ 3`, shift both quotes +1. When `≤ -3`, shift -1.
+
+**Safety clamps:** `bid < wap_int`, `ask > wap_int`. If they cross, reset to `wap ± 1`.
 
 ---
 
-## State Persistence (`traderData`)
+## Files
 
-```json
-{
-  "tomato_window": [float, ...],
-  "spread_window": [float, ...]
-}
-```
-
-Both rolling windows are serialised as JSON each tick and deserialised at
-the start of the next tick. EMERALDS logic is stateless.
+| File | Description |
+|------|-------------|
+| `trader.py` | Main submission (V11) |
+| `trader2.py` | V6 reference |
+| `trader_a.py` | Experiment: SPREAD=2, OBI_WEIGHT=10 |
+| `trader_b.py` | Experiment: SPREAD=2, OBI disabled |
+| `trader_c.py` | Experiment: SPREAD=2, aggressive inv shift |
+| `offline_analyzer.py` | Local backtester using CSV price/trade data |
+| `prices_round_0_day_-1.csv` | Market data for backtesting |
+| `prices_round_0_day_-2.csv` | Market data for backtesting |
 
 ---
 
 ## Constraints
 
-- Pure Python only — no `pandas`, `numpy`, or any external library (`math` from stdlib is allowed)
-- All order prices must be integers (`int(round(...))`)
+- Pure Python only — no `pandas`, `numpy`, or any external library
+- All order prices must be integers
 - Position hard limit: **±20** per symbol, enforced on every order path
+- Return signature: `(orders: dict[str, list[Order]], conversions: int, traderData: str)`
 - Single file delivery: `trader.py`
