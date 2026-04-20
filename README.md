@@ -6,7 +6,7 @@ Algorithmic trading bot for IMC Prosperity 4 competition (April 2026).
 
 | Round    | Score (XIRECs) | Position | Strategy                                    |
 |----------|---------------|----------|---------------------------------------------|
-| Tutorial | ~2,433 PnL    | —        | Emeralds penny MM + Tomatoes WAP MM         |
+| Tutorial | 97,493 PnL    | —        | Emeralds penny MM + Tomatoes WAP MM         |
 | Round 1  | 93,061        | 3,777th  | Pepper drift HODL + Osmium penny MM         |
 | Round 2  | TBD           | TBD      | TBD                                         |
 
